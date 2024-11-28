@@ -1,0 +1,122 @@
+from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget, QPushButton
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QTimer
+import rospy
+import cv2
+import numpy as np
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+from cv_bridge import CvBridge, CvBridgeError
+
+class FireDetectionNode:
+    def __init__(self):
+        # ROS 초기화
+        rospy.init_node('fire_detection_with_gui', anonymous=True)
+
+        # ROS 퍼블리셔 및 cv_bridge
+        self.bridge = CvBridge()
+        self.pub_fire_status = rospy.Publisher('/fire_status', String, queue_size=10)
+        self.pub_fire_image = rospy.Publisher('/fire_detected_image', Image, queue_size=10)
+        self.pub_original_image = rospy.Publisher('/original_image', Image, queue_size=10)
+
+        # OpenCV 카메라 초기화
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            rospy.logerr("Failed to open camera.")
+            exit(1)
+
+        # PyQt5 GUI 초기화
+        self.app = QApplication([])
+        self.window = QWidget()
+        self.window.setWindowTitle("Fire Detection GUI")
+        self.layout = QVBoxLayout()
+
+        # GUI 요소 추가
+        self.original_label = QLabel("Original Image")
+        self.fire_label = QLabel("Fire Detection")
+        self.layout.addWidget(self.original_label)
+        self.layout.addWidget(self.fire_label)
+
+        # 버튼 추가
+        self.detect_button = QPushButton("Toggle Detection")
+        self.detect_button.clicked.connect(self.toggle_detection)
+        self.layout.addWidget(self.detect_button)
+
+        # 상태 변수
+        self.detection_enabled = True  # 화재 감지 활성화 상태
+
+        self.window.setLayout(self.layout)
+        self.window.show()
+
+        # 타이머를 사용하여 주기적으로 카메라 프레임 처리
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.process_frame)
+        self.timer.start(30)
+
+    def toggle_detection(self):
+        """버튼 클릭 시 화재 감지 상태 토글"""
+        self.detection_enabled = not self.detection_enabled
+        status = "enabled" if self.detection_enabled else "disabled"
+        rospy.loginfo(f"Fire detection {status}")
+        self.detect_button.setText("Enable Detection" if not self.detection_enabled else "Disable Detection")
+
+    def process_frame(self):
+        # 카메라 프레임 읽기
+        ret, frame = self.cap.read()
+        if not ret:
+            rospy.logerr("Failed to read frame from camera.")
+            return
+
+        if self.detection_enabled:
+            # BGR에서 HSV 색상으로 변환
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            # 불꽃 색상 범위 정의
+            lower_fire = np.array([0, 50, 50])   # 낮은 HSV 값
+            upper_fire = np.array([200, 225, 255])  # 높은 HSV 값
+
+            # 마스크 생성
+            mask = cv2.inRange(hsv, lower_fire, upper_fire)
+            fire_detected = cv2.bitwise_and(frame, frame, mask=mask)
+
+            # 화재 감지 상태 확인
+            fire_status = "Fire Detected" if cv2.countNonZero(mask) > 0 else "No Fire"
+            rospy.loginfo(fire_status)
+            self.pub_fire_status.publish(fire_status)
+
+            # ROS 메시지로 퍼블리시
+            try:
+                self.pub_fire_image.publish(self.bridge.cv2_to_imgmsg(fire_detected, encoding="bgr8"))
+                self.pub_original_image.publish(self.bridge.cv2_to_imgmsg(frame, encoding="bgr8"))
+            except CvBridgeError as e:
+                rospy.logerr(f"CV Bridge error: {e}")
+
+            # GUI 업데이트
+            self.update_gui(frame, fire_detected)
+        else:
+            # 감지가 비활성화된 경우 원본 이미지만 표시
+            self.update_gui(frame, frame)
+
+    def update_gui(self, original_frame, fire_frame):
+        # OpenCV 이미지를 QPixmap으로 변환하여 GUI에 표시
+        def convert_to_pixmap(cv_img):
+            rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            q_img = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
+            return QPixmap.fromImage(q_img)
+
+        self.original_label.setPixmap(convert_to_pixmap(original_frame))
+        self.fire_label.setPixmap(convert_to_pixmap(fire_frame))
+
+    def run(self):
+        rospy.loginfo("Starting GUI. Press Ctrl+C to exit.")
+        self.app.exec_()
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    try:
+        node = FireDetectionNode()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
